@@ -29,7 +29,7 @@ class FoodItem(ABC):
         self.name = check_name(food_name, "Food name")
         self.donor = check_name(donor, "Donor name")
         self.total = self.remaining = amount
-        self.donated = self.wasted = 0
+        self.pending = self.delivered = self.wasted = 0
         self.deadline, self.eligible = deadline, eligible
         self.condition = check_name(condition, "Condition")
         self.status = "Available"
@@ -39,12 +39,12 @@ class FoodItem(ABC):
         if amount > self.remaining:
             raise ValueError("That is more than the remaining food quantity.")
         self.remaining -= amount
-        if reason == "donated":
-            self.donated += amount
+        if reason == "pending":
+            self.pending += amount
         else:
             self.wasted += amount
         if self.remaining == 0:
-            self.status = "Complete"
+            self.status = "Pending delivery" if self.pending else "Complete"
         else:
             self.status = "Partly accounted for"
     def record_donation(self, amount):
@@ -52,7 +52,12 @@ class FoodItem(ABC):
             raise ValueError("This food is marked as ineligible.")
         if datetime.now() > self.deadline:
             raise ValueError("The entered safe-use deadline has passed.")
-        self._remove_quantity(amount, "donated")
+        self._remove_quantity(amount, "pending")
+    def mark_delivered(self, amount):
+        if amount <= 0 or amount > self.pending:
+            raise ValueError("Delivered quantity exceeds pending food.")
+        self.pending -= amount
+        self.delivered += amount
     def record_waste(self, amount):
         self._remove_quantity(amount, "wasted")
     @abstractmethod
@@ -93,9 +98,10 @@ class Recipient:
         self.categories = set(categories)
         self.capacity = capacity
         self.received = 0
+        self.reserved = 0
     @property
     def available_capacity(self):
-        return self.capacity - self.received
+        return self.capacity - self.received - self.reserved
 class FoodInventory:
     def __init__(self):
         self.items = []
@@ -109,6 +115,7 @@ class FoodInventory:
         return sorted(available_food,
                       key=lambda food: food.calculate_urgency(), reverse=True)
 class DonationManager:
+    next_donation_id = 1
     def __init__(self, inventory):
         self.inventory = inventory
         self.recipients = []
@@ -130,33 +137,56 @@ class DonationManager:
         if amount > recipient.available_capacity:
             raise ValueError("Donation is larger than recipient capacity.")
         food.record_donation(amount)
-        recipient.received += amount
-        self.donations.append((food.id, recipient.id, amount))
+        recipient.reserved += amount
+        donation = {"id": f"D{DonationManager.next_donation_id:03}",
+                    "food": food, "recipient": recipient, "amount": amount,
+                    "status": "Pending"}
+        DonationManager.next_donation_id += 1
+        self.donations.append(donation)
+        print(f"Donation {donation['id']} recorded as Pending.")
+    def mark_delivered(self, donation_id):
+        donation = next((d for d in self.donations
+                         if d["id"].lower() == donation_id.strip().lower()), None)
+        if donation is None:
+            raise ValueError("Donation ID not found.")
+        if donation["status"] == "Delivered":
+            raise ValueError("This donation is already marked Delivered.")
+        amount = donation["amount"]
+        donation["food"].mark_delivered(amount)
+        donation["recipient"].reserved -= amount
+        donation["recipient"].received += amount
+        donation["status"] = "Delivered"
+        print(f"Donation {donation['id']} marked Delivered.")
 class WasteReport:
     def __init__(self, inventory):
         self.inventory = inventory
     def display(self):
         foods = self.inventory.items
         total = sum(food.total for food in foods)
-        donated = sum(food.donated for food in foods)
+        donated = sum(food.delivered for food in foods)
+        pending = sum(food.pending for food in foods)
         wasted = sum(food.wasted for food in foods)
         remaining = sum(food.remaining for food in foods)
-        print(f"\nRegistered {total}, donated {donated}, wasted {wasted}, remaining {remaining}")
-        print(f"Donation: {donated / total * 100 if total else 0:.1f}% | "
+        print(f"\nRegistered {total}, delivered {donated}, pending {pending}, "
+              f"wasted {wasted}, remaining {remaining}")
+        print(f"Delivered: {donated / total * 100 if total else 0:.1f}% | "
               f"waste: {wasted / total * 100 if total else 0:.1f}%")
         print("\nCategory totals:")
         for category in sorted({food.category for food in foods}):
             group = [food for food in foods if food.category == category]
             print(f"{category}: {sum(f.total for f in group)} registered, "
-                  f"{sum(f.donated for f in group)} donated, "
-                  f"{sum(f.wasted for f in group)} wasted")
+                  f"{sum(f.delivered for f in group)} delivered, "
+                  f"{sum(f.pending for f in group)} pending, "
+                  f"{sum(f.wasted for f in group)} wasted, "
+                  f"{sum(f.remaining for f in group)} remaining")
         unresolved = [food for food in foods if food.remaining]
         print("\nUnresolved food:")
         if not unresolved:
             print("None")
         for food in unresolved:
             tag = "urgent" if food.calculate_urgency() >= 70 else "unresolved"
-            print(f"{food.id} {food.name}: {food.remaining} left ({tag})")
+            print(f"{food.id} {food.name}: {food.remaining} left, "
+                  f"{food.pending} pending delivery ({tag})")
 class FoodRescue:
     def __init__(self):
         self.inventory = FoodInventory()
@@ -201,7 +231,8 @@ class FoodRescue:
             return
         for food in foods:
             print(f"{food.id} | {food.name} | {food.category} | "
-                  f"{food.remaining}/{food.total} available | "
+                  f"{food.remaining} available, {food.pending} pending, "
+                  f"{food.delivered} delivered | "
                   f"{food.deadline.strftime(DATE_FORMAT)} | "
                   f"{food.donor} | {food.status} | eligible: {food.eligible}")
     def show_matches(self):
@@ -218,7 +249,9 @@ class FoodRescue:
         self.donation_manager.record_donation(
             input("Food ID: "), input("Recipient ID: "),
             get_quantity("Quantity to donate: "))
-        print("Donation recorded. Delivery is not independently verified.")
+    def mark_delivered(self):
+        donation_id = input("Donation ID (for example D001): ")
+        self.donation_manager.mark_delivered(donation_id)
     def record_waste(self):
         food = self.inventory.find(input("Food ID: "))
         amount = get_quantity("Quantity discarded: ")
@@ -229,13 +262,15 @@ class FoodRescue:
                    "3": self.show_inventory,
                    "4": lambda: self.show_inventory(self.inventory.get_urgent_food()),
                    "5": self.show_matches, "6": self.record_donation,
-                   "7": self.record_waste, "8": self.report.display}
+                   "7": self.mark_delivered, "8": self.record_waste,
+                   "9": self.report.display}
         while True:
             print("\nFoodRescue Menu")
             print("1 Register food | 2 Register recipient | 3 Inventory | 4 Urgent")
-            print("5 Find matches | 6 Donation | 7 Waste | 8 Report | 9 Exit")
+            print("5 Find matches | 6 Record donation | 7 Mark delivered")
+            print("8 Record waste | 9 Report | 10 Exit")
             choice = input("Choose an option: ").strip()
-            if choice == "9":
+            if choice == "10":
                 print("Goodbye. A deadline alone does not prove food is safe.")
                 break
             action = actions.get(choice)
